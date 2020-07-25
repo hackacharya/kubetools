@@ -1,0 +1,162 @@
+#!/bin/bash
+
+# Args:  namespace, appname, file
+# TODO no stateful set support yet.
+#
+# Copyright 2019 hackacharya@gmail.com
+# https://github.com/hackacharya/kubetools/LICENSE
+#
+
+function createPatch() {
+FILE=`mktemp /tmp/kpatch.XXXXXXX.yaml`
+cat > $FILE << END_OF_PATCH
+spec:
+  template:
+    spec:
+      containers:
+      - name: $1
+        image: $2
+END_OF_PATCH
+echo $FILE
+}
+
+function usage() {
+  cat << END_OF_USAGE
+  kpatch [<options>] [new-image-name]
+
+  Patch a set of deployments in a kube cluster with the
+  We generally update the image otfen, build update cycle
+  A script to automate patch deployment with image updates only
+
+   -n namepsace -  default is 'default'
+   -D deployments -  list of deployment naems to change
+   -t tagtouse -  instead of changing full image name just only apply the tags
+   -s pauseseconds -  default is 2 second sleep and pause between updates
+   -w - wait forever for pods to come up after update
+   -y - yes for all questions
+  Example
+    kpatch -w -D frontend,backend -t myimage-latest
+    kpatch -y -D dbproxy dockerhub.io/myrepo/path/dbproxy:0.8.9
+    kpatch -S nats -t 16.0-0.1
+END_OF_USAGE
+}
+
+
+#_DEBUG="echo"
+NS="default"
+TAG=""
+PROMPT="yes"
+SLEEP=4
+WAIT="no"
+EXCLUDE="gce-proxy,vaultinit"
+
+while [ $# -gt 0 ]
+do
+  case $1 in 
+  -h|--help) usage; exit 0;;
+  -p|--pretend) _DEBUG="echo";;
+  -n|--namespace) NS=$2; shift;;
+  -D|--deployments) DEP=$2; shift;;
+  -S|--statefulsets) SS=$2; shift;;
+  -t|--tag) TAG=$2; shift;;
+  -s|--sleep) SLEEP=$2; shift;;
+  -y|--noprompt) PROMPT="no";;
+  -w|--wait) WAIT="yes";;
+  -x|--exclude) EXCLUDE="$2"; shift;;
+  *) NEWIMAGE=$1;;
+  esac
+  shift;
+done
+
+
+if [ "$DEP" == "" ]; then
+  echo "Use -D for specifying deployments. ALL is dangerouse we dont' want to use it"
+  echo
+  usage
+  exit 1
+fi
+
+if [[ "$DEP" =~ "*,*" ]]; then
+  if [ "$TAG" == "" ]; then
+     echo "When specifying multiple deployment a tag must be specified. That will be used to update current image"
+     exit 1;
+  fi 
+  if [ "$NEWIMAGE" != "" ]; then
+     echo "When specifying multiple deployment an image name cannot be specified. Only tag will be used with current image."
+     exit 1;
+  fi
+fi
+
+if [[ "$EXCLUDE" != "" ]]; then
+  excmd="grep -vw"
+  for ex in `echo $EXCLUDE | sed 's/,/ /g'`
+  do
+    excmd="$excmd -e $ex"
+  done
+else
+  excmd="grep -vw _noway_"
+fi
+
+
+# If a tag is specified and multiple deployments ar ethere
+# replace the current image change only the tag
+#
+# If an image name specified then there can obviously be 
+# NO TAG replacement but full image replacement
+# 
+# TODO support stateful set
+#
+# We assume only one image in the pod, we remove 
+#
+
+for dep in `echo $DEP | sed 's/,/ /g'`
+do
+    FULLIMG=`kubectl describe deployment $dep | grep 'Image:'  | eval $excmd | cut -d":" -f2,3`
+    IMG=`echo $FULLIMG | cut  -d":" -f1`
+
+    if [ "$IMG" == "" ]; then
+      echo "$dep - Cannot find a deployment with that name. Skipped"
+      continue
+    fi
+
+    # Hope we got only one image
+    if [ "$TAG" != "" ]; then
+        IMGTOUPDATE="$IMG:$TAG"
+    else
+        IMGTOUPDATE="$NEWIMAGE"
+    fi
+
+    export PATCHFILE=`createPatch $dep $IMGTOUPDATE`
+    if [ "$PROMPT" == "yes" ]; then
+        echo "$dep - Replacing $IMG with $IMGTOUPDATE "
+        read -p "Go ahead?" ans
+        if  [ "$ans" != "yes" ]; then
+          rm -f $PATCHFILE
+          continue
+        fi
+    else
+        echo "$dep - Replacing $IMG with $IMGTOUPDATE "
+    fi
+    ${_DEBUG} kubectl patch deployment $dep --patch "$(cat $PATCHFILE)"
+    if [ $? -eq 0 ]; then
+        echo "$dep - done!"
+    else
+        echo "$dep - failed!"
+    fi
+    rm -f $PATCHFILE
+
+    if [ "$WAIT" == "yes" ]; then
+      while true 
+      do
+        # Improve this check where mutliple pods are there.
+        echo "Waiting for atleast one $dep pod to come up ..."
+        sleep $SLEEP
+        kubectl get pods | grep -w $dep | grep -w Running
+        if [ $? -ne 0 ]; then
+          continue;
+        else
+          break;
+        fi
+      done
+    fi
+done
